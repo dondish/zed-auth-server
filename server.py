@@ -23,6 +23,8 @@ the website-ish routes and the cloud API routes live here):
   WS   /client/users/connect         cloud websocket (accepted and held open)
   POST /client/llm_tokens            dummy LLM token
   PATCH /client/system_settings      echoes back the settings
+  GET  /extensions[...]              extension store (list/updates/download);
+                                     mirror populated by scrape_extensions.py
 
 Collab-facing internal API (Bearer <internal api key>; collab in development
 mode hardcodes this to http://localhost:8787, so we bind a plain-HTTP listener
@@ -290,6 +292,9 @@ COLLAB_DATABASE_URL: Optional[str] = None
 # Directory holding scraped release installers + index.json (see
 # scrape_releases.py). Served by the /releases auto-update API.
 RELEASES_DIR: Path = Path("releases")
+# Directory holding scraped extension archives + index.json (see
+# scrape_extensions.py). Served by the /extensions API.
+EXTENSIONS_DIR: Path = Path("extensions")
 
 
 def ensure_collab_user(user: dict) -> None:
@@ -471,6 +476,138 @@ async def release_download(
     if not path.exists():
         return JSONResponse({"error": "asset file missing"}, status_code=404)
     return FileResponse(path, media_type="application/octet-stream", filename=filename)
+
+
+# --- Extensions API ---------------------------------------------------------
+#
+# Zed's extension store (crates/extension_host) reaches these routes via
+# `build_zed_api_url`, which for a custom server_url uses the same base URL —
+# so they live on the client-facing HTTPS listener alongside /client/*.
+#
+#   GET /extensions?max_schema_version=&filter=&provides=   catalog / search
+#   GET /extensions/updates?ids=&min_schema_version=&...     update check
+#   GET /extensions/{id}                                     versions of one ext
+#   GET /extensions/{id}/download                            latest archive.tar.gz
+#   GET /extensions/{id}/{version}/download                  a specific archive
+#
+# The JSON routes return {"data": [ExtensionMetadata]} (matching collab /
+# cloud_api_types::GetExtensionsResponse). The download routes serve the
+# gzipped tar the client unpacks into its extensions dir. Populate the mirror
+# with scrape_extensions.py.
+
+
+def load_extension_index() -> dict:
+    path = EXTENSIONS_DIR / "index.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("extensions", {})
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+# Fields that are internal to the mirror and must not leak into API responses
+# (the client deserializes into a strict ExtensionMetadata struct).
+_EXT_INTERNAL_FIELDS = ("archive",)
+
+
+def _public_metadata(entry: dict) -> dict:
+    return {k: v for k, v in entry.items() if k not in _EXT_INTERNAL_FIELDS}
+
+
+def _latest_version(entries: list[dict]) -> dict:
+    return max(entries, key=lambda e: _semver_key(e["version"]))
+
+
+@app.get("/extensions")
+async def list_extensions(
+    max_schema_version: int = 1,
+    filter: str = "",
+    provides: str = "",
+):
+    index = load_extension_index()
+    provides_filter = {p for p in provides.split(",") if p} if provides else set()
+    needle = filter.lower().strip()
+
+    data = []
+    for entries in index.values():
+        if not entries:
+            continue
+        entry = _latest_version(entries)
+        if (entry.get("schema_version") or 0) > max_schema_version:
+            continue
+        if provides_filter and not provides_filter.issubset(set(entry.get("provides", []))):
+            continue
+        if needle:
+            haystack = " ".join(
+                str(entry.get(k, "")) for k in ("id", "name", "description")
+            ).lower()
+            if needle not in haystack:
+                continue
+        data.append(_public_metadata(entry))
+
+    data.sort(key=lambda e: e.get("download_count", 0), reverse=True)
+    return {"data": data}
+
+
+@app.get("/extensions/updates")
+async def extension_updates(
+    ids: str = "",
+    min_schema_version: int = 0,
+    max_schema_version: int = 1,
+    min_wasm_api_version: str = "",
+    max_wasm_api_version: str = "",
+):
+    index = load_extension_index()
+    wanted = [i.strip() for i in ids.split(",") if i.strip()]
+    data = []
+    for ext_id in wanted:
+        entries = index.get(ext_id)
+        if not entries:
+            continue
+        entry = _latest_version(entries)
+        schema = entry.get("schema_version") or 0
+        if not (min_schema_version <= schema <= max_schema_version):
+            continue
+        data.append(_public_metadata(entry))
+    return {"data": data}
+
+
+@app.get("/extensions/{extension_id}")
+async def extension_versions(extension_id: str):
+    entries = load_extension_index().get(extension_id, [])
+    data = [
+        _public_metadata(e)
+        for e in sorted(entries, key=lambda e: _semver_key(e["version"]), reverse=True)
+    ]
+    return {"data": data}
+
+
+def _serve_extension_archive(extension_id: str, entry: dict):
+    archive = entry.get("archive")
+    if not archive:
+        return JSONResponse({"error": "no archive for version"}, status_code=404)
+    path = EXTENSIONS_DIR / archive
+    if not path.exists():
+        return JSONResponse({"error": "archive file missing"}, status_code=404)
+    return FileResponse(path, media_type="application/gzip", filename=archive)
+
+
+@app.get("/extensions/{extension_id}/download")
+async def download_latest_extension(extension_id: str):
+    entries = load_extension_index().get(extension_id)
+    if not entries:
+        return JSONResponse({"error": "unknown extension"}, status_code=404)
+    return _serve_extension_archive(extension_id, _latest_version(entries))
+
+
+@app.get("/extensions/{extension_id}/{version}/download")
+async def download_extension(extension_id: str, version: str):
+    entries = load_extension_index().get(extension_id, [])
+    entry = next((e for e in entries if e["version"] == version), None)
+    if entry is None:
+        return JSONResponse({"error": "unknown extension version"}, status_code=404)
+    return _serve_extension_archive(extension_id, entry)
 
 
 def _human_size(num_bytes: int) -> str:
@@ -753,7 +890,7 @@ async def serve(args: argparse.Namespace) -> None:
 
 def main() -> None:
     global store, INTERNAL_API_KEY, COLLAB_RPC_URL, DEFAULT_USERNAME
-    global COLLAB_DATABASE_URL, RELEASES_DIR
+    global COLLAB_DATABASE_URL, RELEASES_DIR, EXTENSIONS_DIR
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0")
@@ -789,6 +926,11 @@ def main() -> None:
         default=os.environ.get("RELEASES_DIR", "releases"),
         help="Directory with scraped installers + index.json for /releases",
     )
+    parser.add_argument(
+        "--extensions-dir",
+        default=os.environ.get("EXTENSIONS_DIR", "extensions"),
+        help="Directory with scraped extension archives + index.json for /extensions",
+    )
     args = parser.parse_args()
 
     cert_dir = Path(args.cert_dir)
@@ -800,6 +942,7 @@ def main() -> None:
     COLLAB_RPC_URL = args.collab_rpc_url
     COLLAB_DATABASE_URL = args.collab_database_url
     RELEASES_DIR = Path(args.releases_dir)
+    EXTENSIONS_DIR = Path(args.extensions_dir)
     DEFAULT_USERNAME = args.default_username
 
     asyncio.run(serve(args))

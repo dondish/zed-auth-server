@@ -22,6 +22,8 @@ can reach the server can sign in as anyone. Local/LAN testing only.
 | `PATCH /client/system_settings` | Zed client | echo stub |
 | `GET /releases/{channel}/{version}/asset` | Zed auto-updater | returns `{version, url}` for an install |
 | `GET /releases/download/...` | Zed auto-updater | serves the installer binary itself |
+| `GET /extensions`, `/extensions/updates`, `/extensions/{id}` | Zed extension store | catalog / update-check / versions (`{data:[…]}`) |
+| `GET /extensions/{id}[/{version}]/download` | Zed extension store | serves the extension's `archive.tar.gz` |
 | `POST /internal/users/*`, `/internal/channel_members/*` | collab | user directory (Bearer-authenticated internal API) |
 
 Users and tokens persist in `data/state.json`.
@@ -50,6 +52,35 @@ python scrape_releases.py --os macos --arch aarch64 --versions 1.10.2 1.10.1
 The server resolves `latest` to the highest scraped semver for the requested
 `channel/os/arch/asset`. To see an update actually download, the served
 `latest` must be **newer** than the Zed you're running.
+
+## Extensions
+
+Zed's extension store ([`crates/extension_host`](../zed/crates/extension_host))
+reaches the API via `build_zed_api_url`, which for a custom `server_url` uses
+that same base URL — so the extension routes are served on the client-facing
+HTTPS listener (8443), not the internal collab port. It calls:
+
+- `GET /extensions?max_schema_version=&filter=&provides=` — catalog / search
+- `GET /extensions/updates?ids=&min_schema_version=&…` — update check
+- `GET /extensions/{id}` — all versions of one extension
+- `GET /extensions/{id}/download` and `/extensions/{id}/{version}/download` —
+  the extension's `archive.tar.gz`, which Zed unpacks into its extensions dir
+
+The JSON routes return `{"data": [ExtensionMetadata]}`, matching
+`cloud_api_types::GetExtensionsResponse`.
+
+`scrape_extensions.py` mirrors extensions from Zed's real API (`api.zed.dev`)
+into `extensions/` (git-ignored, regenerate with the scraper):
+
+```sh
+python scrape_extensions.py                     # small curated default set
+python scrape_extensions.py --filter toml       # everything matching a term
+python scrape_extensions.py --ids toml dockerfile nix
+python scrape_extensions.py --all --limit 50    # top 50 by download count
+```
+
+Only mirrored extensions appear in the in-app store; install/update works
+entirely from this machine.
 
 ## Setup
 
@@ -165,6 +196,8 @@ long as collab reaches this server at `localhost:8787` and
 --collab-rpc-url ...      explicit Location for GET /rpc
 --collab-database-url ... mirror users into collab's Postgres (for FK constraints)
 --default-username local  username prefilled on the sign-in form
+--releases-dir releases   scraped installers + index.json for /releases
+--extensions-dir extensions  scraped extension archives + index.json for /extensions
 ```
 
 ## Tests
