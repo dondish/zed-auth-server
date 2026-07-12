@@ -45,9 +45,12 @@ services:
       # http://<request-host>:8080/rpc; override if clients reach collab
       # under a different host/port than they reach this server.
       COLLAB_RPC_URL: "${COLLAB_RPC_URL:-}"
+      RELEASES_DIR: "/releases"
     volumes:
       - ./certs:/certs:ro
       - clouddata:/data
+      # Scraped release installers served by the /releases auto-update API.
+      - ./releases:/releases:ro
     ports:
       - "8443:8443"   # client-facing HTTPS  (Zed's server_url)
       - "8080:8080"   # collab RPC websocket (served by the collab container)

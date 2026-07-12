@@ -2,6 +2,9 @@
 certs/
 data/
 
+# Scraped release installers (large binaries; regenerate with scrape_releases.py)
+releases/
+
 # Python
 __pycache__/
 *.pyc

@@ -63,7 +63,12 @@ import uvicorn
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+)
 from pydantic import BaseModel
 
 try:
@@ -282,6 +287,9 @@ DEFAULT_USERNAME = "local"
 # foreign keys from projects/rooms/contacts/etc. to users(id), so a user must
 # exist there (keyed by legacy_user_id) before they can collaborate.
 COLLAB_DATABASE_URL: Optional[str] = None
+# Directory holding scraped release installers + index.json (see
+# scrape_releases.py). Served by the /releases auto-update API.
+RELEASES_DIR: Path = Path("releases")
 
 
 def ensure_collab_user(user: dict) -> None:
@@ -385,6 +393,84 @@ async def rpc_redirect(request: Request):
         host = request.url.hostname or "127.0.0.1"
         location = f"http://{host}:8080/rpc"
     return RedirectResponse(location, 302)
+
+
+# --- Release / auto-update API ---------------------------------------------
+#
+# Zed's auto-updater (crates/auto_update) calls
+#   GET /releases/{channel}/{version}/asset?asset=zed&os=..&arch=..
+# and expects JSON {"version": "..", "url": ".."}. It then downloads `url`,
+# and on Windows runs it as an installer. `version` may be "latest".
+#
+# We serve installers scraped by scrape_releases.py into releases/index.json,
+# and host the binaries ourselves via /releases/download/... below.
+
+
+def load_release_index() -> dict:
+    path = RELEASES_DIR / "index.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _semver_key(version: str) -> tuple:
+    # Compare only the numeric release fields (matches the client, which
+    # strips pre-release/build metadata before comparing).
+    parts = version.split("-")[0].split(".")
+    return tuple(int(p) if p.isdigit() else 0 for p in parts)
+
+
+@app.get("/releases/{channel}/{version}/asset")
+async def release_asset(
+    channel: str,
+    version: str,
+    request: Request,
+    asset: str = "zed",
+    os: str = "",
+    arch: str = "",
+):
+    index = load_release_index()
+    key = f"{channel}/{os}/{arch}/{asset}"
+    entries = index.get(key, [])
+    if not entries:
+        return JSONResponse(
+            {"error": f"no releases for {key}"}, status_code=404
+        )
+
+    if version == "latest":
+        entry = max(entries, key=lambda e: _semver_key(e["version"]))
+    else:
+        wanted = _semver_key(version)
+        entry = next(
+            (e for e in entries if _semver_key(e["version"]) == wanted), None
+        )
+        if entry is None:
+            return JSONResponse(
+                {"error": f"version {version} not found for {key}"}, status_code=404
+            )
+
+    # Point the download URL back at this server so updates are self-hosted.
+    base = str(request.base_url).rstrip("/")
+    download_url = f"{base}/releases/download/{channel}/{os}/{arch}/{asset}/{entry['file']}"
+    return {"version": entry["version"], "url": download_url}
+
+
+@app.get("/releases/download/{channel}/{os}/{arch}/{asset}/{filename}")
+async def release_download(
+    channel: str, os: str, arch: str, asset: str, filename: str
+):
+    # Guard against path traversal: only serve files named in the index.
+    key = f"{channel}/{os}/{arch}/{asset}"
+    entries = load_release_index().get(key, [])
+    if not any(e["file"] == filename for e in entries):
+        return JSONResponse({"error": "unknown asset"}, status_code=404)
+    path = RELEASES_DIR / filename
+    if not path.exists():
+        return JSONResponse({"error": "asset file missing"}, status_code=404)
+    return FileResponse(path, media_type="application/octet-stream", filename=filename)
 
 
 # --- Cloud client API ------------------------------------------------------
@@ -574,7 +660,7 @@ async def serve(args: argparse.Namespace) -> None:
 
 def main() -> None:
     global store, INTERNAL_API_KEY, COLLAB_RPC_URL, DEFAULT_USERNAME
-    global COLLAB_DATABASE_URL
+    global COLLAB_DATABASE_URL, RELEASES_DIR
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0")
@@ -605,6 +691,11 @@ def main() -> None:
         "(required for collaboration; FK constraints reference users.id)",
     )
     parser.add_argument("--default-username", default="local")
+    parser.add_argument(
+        "--releases-dir",
+        default=os.environ.get("RELEASES_DIR", "releases"),
+        help="Directory with scraped installers + index.json for /releases",
+    )
     args = parser.parse_args()
 
     cert_dir = Path(args.cert_dir)
@@ -615,6 +706,7 @@ def main() -> None:
     INTERNAL_API_KEY = args.internal_api_key
     COLLAB_RPC_URL = args.collab_rpc_url
     COLLAB_DATABASE_URL = args.collab_database_url
+    RELEASES_DIR = Path(args.releases_dir)
     DEFAULT_USERNAME = args.default_username
 
     asyncio.run(serve(args))

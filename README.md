@@ -20,9 +20,36 @@ can reach the server can sign in as anyone. Local/LAN testing only.
 | `WS /client/users/connect` | Zed client | cloud websocket (held open, no messages) |
 | `POST /client/llm_tokens` | Zed client | dummy token (LLM features are not proxied) |
 | `PATCH /client/system_settings` | Zed client | echo stub |
+| `GET /releases/{channel}/{version}/asset` | Zed auto-updater | returns `{version, url}` for an install |
+| `GET /releases/download/...` | Zed auto-updater | serves the installer binary itself |
 | `POST /internal/users/*`, `/internal/channel_members/*` | collab | user directory (Bearer-authenticated internal API) |
 
 Users and tokens persist in `data/state.json`.
+
+## Auto-updates (releases API)
+
+Zed's auto-updater ([`crates/auto_update`](../zed/crates/auto_update)) calls
+`GET /releases/{channel}/{version}/asset?asset=zed&os=..&arch=..` and expects
+`{"version": "..", "url": ".."}`, then downloads `url` (on Windows, it runs the
+result as an installer). `version` may be `latest`.
+
+`scrape_releases.py` populates `releases/` by querying Zed's real endpoint
+(`cloud.zed.dev`), downloading the installer for each version, and writing
+`releases/index.json`. The server then hosts those binaries itself, so updates
+come from this machine, not GitHub.
+
+```sh
+# Default: last 3 stable Windows x86_64 builds (~83MB each)
+python scrape_releases.py
+
+# Other platforms / versions:
+python scrape_releases.py --os macos --arch aarch64 --versions 1.10.2 1.10.1
+```
+
+`releases/` is git-ignored (large binaries) — regenerate it with the scraper.
+The server resolves `latest` to the highest scraped semver for the requested
+`channel/os/arch/asset`. To see an update actually download, the served
+`latest` must be **newer** than the Zed you're running.
 
 ## Setup
 
@@ -93,6 +120,11 @@ mode ([`crates/collab/src/lib.rs`](../zed/crates/collab/src/lib.rs)), so the
 `collab` container shares the `cloud` container's network namespace
 (`network_mode: service:cloud`). That's why collab's 8080 is published by the
 `cloud` service, and why both must run on the same machine.
+
+> **Gotcha:** because collab shares cloud's namespace, recreating the `cloud`
+> container (e.g. `docker compose up --build cloud`) orphans collab's network.
+> After rebuilding cloud, recreate collab too:
+> `docker compose up -d --force-recreate collab`.
 
 ### Users and the collab database
 
