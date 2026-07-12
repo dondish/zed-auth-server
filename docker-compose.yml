@@ -1,0 +1,85 @@
+# Self-hosted Zed collaboration stack.
+#
+#   postgres  — collab's database (schema auto-loaded from the repo's dump)
+#   cloud     — the FastAPI auth/cloud stand-in (this project)
+#   collab    — Zed's collaboration server, built from ../zed
+#
+# collab's cloud URL is hardcoded to http://localhost:8787 in development mode
+# (crates/collab/src/lib.rs), so `collab` shares `cloud`'s network namespace
+# (network_mode: service:cloud) — that makes localhost:8787 resolve to the
+# cloud container, and lets collab reach postgres through cloud's DNS.
+#
+# Because of that shared namespace, collab's HTTP port (8080) is published by
+# the `cloud` service, not by `collab`.
+#
+# Prerequisites:
+#   1. Generate certs on the host:  python gen_certs.py --hostname zed.dondish.me
+#   2. The Zed repo must be checked out at ../zed (sibling of this project).
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: zed
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # The schema dump runs once, on first initialization of the volume.
+      - ../zed/crates/collab/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d zed"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [zednet]
+
+  cloud:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      ZED_CLOUD_INTERNAL_API_KEY: "${INTERNAL_API_KEY:-internal-api-key-secret}"
+      COLLAB_DATABASE_URL: "postgres://postgres:postgres@postgres:5432/zed"
+      # Where GET /rpc sends clients for the collab websocket. Defaults to
+      # http://<request-host>:8080/rpc; override if clients reach collab
+      # under a different host/port than they reach this server.
+      COLLAB_RPC_URL: "${COLLAB_RPC_URL:-}"
+    volumes:
+      - ./certs:/certs:ro
+      - clouddata:/data
+    ports:
+      - "8443:8443"   # client-facing HTTPS  (Zed's server_url)
+      - "8080:8080"   # collab RPC websocket (served by the collab container)
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [zednet]
+
+  collab:
+    build:
+      context: ../zed
+      dockerfile: Dockerfile-collab
+    # Share the cloud container's network stack so collab's hardcoded
+    # http://localhost:8787 cloud URL reaches the cloud service.
+    network_mode: "service:cloud"
+    environment:
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/zed"
+      DATABASE_MAX_CONNECTIONS: "5"
+      HTTP_PORT: "8080"
+      ZED_ENVIRONMENT: "development"
+      ZED_CLOUD_INTERNAL_API_KEY: "${INTERNAL_API_KEY:-internal-api-key-secret}"
+      RUST_LOG: "info"
+    command: ["serve", "collab"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      cloud:
+        condition: service_started
+
+volumes:
+  pgdata:
+  clouddata:
+
+networks:
+  zednet:

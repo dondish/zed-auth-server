@@ -1,0 +1,13 @@
+# Secrets — private keys and issued tokens. Never commit these.
+certs/
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build / runtime artifacts
+build-collab.log
+*.log
