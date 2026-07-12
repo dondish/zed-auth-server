@@ -58,8 +58,10 @@ services:
 
   collab:
     build:
+      # Context is the Zed source tree (collab compiles the whole workspace);
+      # the Dockerfile is vendored in this repo (path is relative to context).
       context: ../zed
-      dockerfile: Dockerfile-collab
+      dockerfile: ../zed-auth-server/Dockerfile-collab
     # Share the cloud container's network stack so collab's hardcoded
     # http://localhost:8787 cloud URL reaches the cloud service.
     network_mode: "service:cloud"
