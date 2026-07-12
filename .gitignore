@@ -1,6 +1,7 @@
-# Secrets — private keys and issued tokens. Never commit these.
+# Secrets — private keys, issued tokens, OAuth client secret. Never commit.
 certs/
 data/
+.env
 
 # Scraped release installers (large binaries; regenerate with scrape_releases.py)
 releases/

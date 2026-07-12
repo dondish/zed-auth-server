@@ -5,15 +5,18 @@ zed.dev sign-in page and the "cloud" API service — so that a Zed client plus a
 self-hosted [collab server](https://github.com/zed-industries/zed/tree/main/crates/collab)
 can work end to end without zed.dev.
 
-**No real security**: identity is username-only with no passwords. Anyone who
-can reach the server can sign in as anyone. Local/LAN testing only.
+Sign-in is backed by **GitLab OAuth** (gitlab.com or any self-hosted instance)
+when configured; otherwise it falls back to a password-less username form for
+local testing. Either way this is a self-hosted test backend — it grants every
+signed-in user a `zed_free` plan and admin — not a hardened one.
 
 ## What it implements
 
 | Route | Consumer | Purpose |
 |---|---|---|
-| `GET /native_app_signin` | browser | sign-in page (opened by Zed) |
-| `GET /native_app_signin/complete` | browser | issues RSA-OAEP-encrypted token, redirects to Zed's localhost callback |
+| `GET /native_app_signin` | browser | starts sign-in — redirects to GitLab OAuth, or shows the username form |
+| `GET /auth/gitlab/callback` | browser (from GitLab) | maps the GitLab identity to a user, issues the token |
+| `GET /native_app_signin/complete` | browser | username-form fallback: issues RSA-OAEP-encrypted token, redirects to Zed's localhost callback |
 | `GET /native_app_signin_succeeded` | browser | post-sign-in landing page |
 | `GET /rpc` | Zed client | 302 redirect to the collab websocket URL |
 | `GET /client/users/me` | Zed client + collab | token validation, returns `GetAuthenticatedUserResponse` |
@@ -27,6 +30,32 @@ can reach the server can sign in as anyone. Local/LAN testing only.
 | `POST /internal/users/*`, `/internal/channel_members/*` | collab | user directory (Bearer-authenticated internal API) |
 
 Users and tokens persist in `data/state.json`.
+
+## Authentication (GitLab OAuth)
+
+When `GITLAB_CLIENT_ID` and `GITLAB_CLIENT_SECRET` are set, sign-in is backed by
+GitLab's OAuth authorization-code flow:
+
+1. Zed opens `GET /native_app_signin`; the server stashes the app's callback
+   port + public key under a random `state` and redirects the browser to
+   `{GITLAB_URL}/oauth/authorize`.
+2. After the user approves, GitLab redirects to `GET /auth/gitlab/callback`,
+   which exchanges the `code` for a token, fetches `GET /api/v4/user`, and maps
+   the GitLab **username / name / avatar** onto a Zed user (keyed by the stable
+   GitLab user id, so it survives a username change).
+3. The server issues a Zed access token, RSA-OAEP-encrypts it with the app's
+   public key, and redirects back to Zed's `127.0.0.1` callback — same as the
+   username form.
+
+`state` is single-use and expires after 10 minutes; the GitLab token never
+reaches the Zed client. **Any custom GitLab instance** works — just point
+`GITLAB_URL` at it. If the credentials are unset, the password-less username
+form is used instead (handy for local multi-instance collaboration testing).
+
+Set up an OAuth application on GitLab (redirect URI
+`https://zed.dondish.me:8443/auth/gitlab/callback`, scope `read_user`), then
+copy `.env.example` to `.env` and fill it in — `docker compose` picks it up
+automatically. Standalone, pass `--gitlab-client-id/-secret/-url/-redirect-uri`.
 
 ## Auto-updates (releases API)
 
@@ -195,9 +224,14 @@ long as collab reaches this server at `localhost:8787` and
 --internal-api-key ...    must match collab's ZED_CLOUD_INTERNAL_API_KEY
 --collab-rpc-url ...      explicit Location for GET /rpc
 --collab-database-url ... mirror users into collab's Postgres (for FK constraints)
---default-username local  username prefilled on the sign-in form
+--default-username local  username prefilled on the sign-in form (fallback only)
 --releases-dir releases   scraped installers + index.json for /releases
 --extensions-dir extensions  scraped extension archives + index.json for /extensions
+--gitlab-url https://gitlab.com   GitLab instance (custom / self-hosted ok)
+--gitlab-client-id ...    OAuth app id (enables GitLab sign-in with the secret)
+--gitlab-client-secret ...  OAuth app secret
+--gitlab-redirect-uri ... callback registered on the GitLab app (else derived)
+--gitlab-scope read_user  OAuth scopes to request
 ```
 
 ## Tests

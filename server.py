@@ -13,9 +13,13 @@ Client-facing endpoints (Zed reaches these at `server_url`; for a custom
 server_url the client's `build_zed_cloud_url` uses the same base URL, so both
 the website-ish routes and the cloud API routes live here):
 
-  GET  /native_app_signin            browser sign-in page (username form)
-  GET  /native_app_signin/complete   issues an encrypted token, redirects to
-                                     the Zed app's localhost callback
+  GET  /native_app_signin            starts sign-in: redirects to GitLab OAuth
+                                     when configured, else a username form
+  GET  /native_app_signin/complete   username-form fallback: issues an
+                                     encrypted token, redirects to the Zed
+                                     app's localhost callback
+  GET  /auth/gitlab/callback         GitLab OAuth callback: maps the GitLab
+                                     identity to a user, then issues the token
   GET  /native_app_signin_succeeded  "you're signed in" page
   GET  /rpc                          302 redirect telling the client where the
                                      collab websocket lives
@@ -37,11 +41,13 @@ there too):
   POST /internal/users/fuzzy_search
   POST /internal/channel_members/fuzzy_search_by_github_login
 
-Identity model: username-only, no passwords. The sign-in form defaults to a
-single local user; typing a different name creates another user (needed to
-test collaboration between two Zed instances). Users and tokens persist in
-data/state.json. This provides NO real security — anyone who can reach the
-server can sign in as anyone. Local/LAN testing only.
+Identity model: GitLab OAuth when GITLAB_CLIENT_ID/SECRET are configured (any
+gitlab.com or self-hosted instance via GITLAB_URL) — the GitLab username, name
+and avatar become the Zed identity, keyed by the stable GitLab user id. Without
+GitLab configured it falls back to a password-less username form (typing a name
+creates that user), which is handy for local multi-instance testing. Users and
+tokens persist in data/state.json. Even with GitLab, this grants everyone a
+zed_free plan and admin — it is a self-hosted test backend, not a hardened one.
 
 Usage:
     python gen_certs.py --hostname zed.dondish.me   # once
@@ -55,12 +61,16 @@ import asyncio
 import base64
 import json
 import os
+import secrets
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlencode
 
+import httpx
 import uvicorn
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -176,29 +186,57 @@ class Store:
             encoding="utf-8",
         )
 
-    def get_or_create_user(self, username: str) -> dict:
+    def get_or_create_user(
+        self, identity: str, profile: Optional[dict] = None
+    ) -> dict:
+        """Look up (or create) a user by a stable identity key.
+
+        `identity` is the storage key: a bare username for the legacy form /
+        impersonation, or e.g. "gitlab:<id>" for an OAuth identity (so a GitLab
+        user survives a username change). `profile`, when given, supplies/
+        refreshes the display fields (username, github_login, avatar_url, name,
+        is_staff) on each login.
+        """
+        profile = profile or {}
         with self.lock:
-            user = self.users.get(username)
+            user = self.users.get(identity)
             if user is None:
+                username = profile.get("username") or identity
                 user = {
                     "id": str(uuid.uuid4()),
                     "legacy_user_id": self.next_user_id,
                     "metrics_id": str(uuid.uuid4()),
                     "username": username,
-                    "github_login": username,
-                    "avatar_url": f"https://zed.dev/user_avatar/{username}.png",
-                    "name": None,
-                    "is_staff": True,
+                    "github_login": profile.get("github_login") or username,
+                    "avatar_url": profile.get("avatar_url")
+                    or f"https://zed.dev/user_avatar/{username}.png",
+                    "name": profile.get("name"),
+                    "is_staff": profile.get("is_staff", True),
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }
-                self.users[username] = user
+                self.users[identity] = user
                 self.next_user_id += 1
                 self._save()
+            elif profile:
+                # Refresh mutable profile fields on subsequent logins.
+                changed = False
+                for field in ("username", "github_login", "avatar_url", "name", "is_staff"):
+                    if field in profile and profile[field] is not None and user.get(field) != profile[field]:
+                        user[field] = profile[field]
+                        changed = True
+                if changed:
+                    self._save()
             return user
 
     def user_by_legacy_id(self, legacy_id: int) -> Optional[dict]:
         for user in self.users.values():
             if user["legacy_user_id"] == legacy_id:
+                return user
+        return None
+
+    def user_by_github_login(self, github_login: str) -> Optional[dict]:
+        for user in self.users.values():
+            if user.get("github_login") == github_login:
                 return user
         return None
 
@@ -296,6 +334,63 @@ RELEASES_DIR: Path = Path("releases")
 # scrape_extensions.py). Served by the /extensions API.
 EXTENSIONS_DIR: Path = Path("extensions")
 
+# --- GitLab OAuth ----------------------------------------------------------
+# When GITLAB_CLIENT_ID and GITLAB_CLIENT_SECRET are set, sign-in is backed by
+# GitLab's OAuth (authorization code flow) instead of the password-less
+# username form. GITLAB_URL points at any GitLab instance (gitlab.com or a
+# self-hosted one). GITLAB_REDIRECT_URI, when set, must exactly match the
+# callback registered on the GitLab application; otherwise it is derived from
+# the incoming request as <base>/auth/gitlab/callback.
+GITLAB_URL = "https://gitlab.com"
+GITLAB_CLIENT_ID: Optional[str] = None
+GITLAB_CLIENT_SECRET: Optional[str] = None
+GITLAB_REDIRECT_URI: Optional[str] = None
+GITLAB_SCOPE = "read_user"
+
+
+def gitlab_enabled() -> bool:
+    return bool(GITLAB_CLIENT_ID and GITLAB_CLIENT_SECRET)
+
+
+class PendingSignins:
+    """Short-lived store correlating an OAuth `state` back to the Zed app's
+    localhost callback port + public key across the GitLab round-trip."""
+
+    TTL_SECONDS = 600
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending: dict[str, dict] = {}
+
+    def create(self, port: int, public_key: str, redirect_uri: str) -> str:
+        state = secrets.token_urlsafe(24)
+        with self.lock:
+            self._evict_expired()
+            self.pending[state] = {
+                "port": port,
+                "public_key": public_key,
+                "redirect_uri": redirect_uri,
+                "created_at": time.monotonic(),
+            }
+        return state
+
+    def take(self, state: str) -> Optional[dict]:
+        with self.lock:
+            self._evict_expired()
+            return self.pending.pop(state, None)
+
+    def _evict_expired(self) -> None:
+        now = time.monotonic()
+        stale = [
+            s for s, r in self.pending.items()
+            if now - r["created_at"] > self.TTL_SECONDS
+        ]
+        for s in stale:
+            del self.pending[s]
+
+
+pending_signins = PendingSignins()
+
 
 def ensure_collab_user(user: dict) -> None:
     """Upsert a row into collab's `users` table so FK constraints are satisfied.
@@ -343,8 +438,53 @@ p.warn {{ color: #999; font-size: .85rem; max-width: 28rem; }}
 </form></body></html>"""
 
 
+def _gitlab_redirect_uri(request: Request) -> str:
+    if GITLAB_REDIRECT_URI:
+        return GITLAB_REDIRECT_URI
+    return str(request.base_url).rstrip("/") + "/auth/gitlab/callback"
+
+
+def finish_signin(port: int, public_key_b64: str, user: dict):
+    """Issue a Zed token for `user`, encrypt it with the app's public key, and
+    redirect back to the Zed desktop app's localhost callback."""
+    public_key = parse_pkcs1_der_public_key(b64url_decode(public_key_b64))
+    ensure_collab_user(user)
+    token = store.issue_token(user)
+    encrypted = encrypt_for_client(public_key, token)
+    query = urlencode(
+        {"user_id": str(user["legacy_user_id"]), "access_token": encrypted}
+    )
+    return RedirectResponse(f"http://127.0.0.1:{port}/?{query}", 302)
+
+
 @app.get("/native_app_signin")
-async def native_app_signin(native_app_port: int, native_app_public_key: str):
+async def native_app_signin(
+    request: Request, native_app_port: int, native_app_public_key: str
+):
+    if gitlab_enabled():
+        # Validate the public key up front so a bad key fails here, not after
+        # the GitLab round-trip.
+        try:
+            parse_pkcs1_der_public_key(b64url_decode(native_app_public_key))
+        except Exception as exc:  # noqa: BLE001
+            return HTMLResponse(
+                f"<h1>Invalid public key</h1><p>{exc}</p>", status_code=400
+            )
+        redirect_uri = _gitlab_redirect_uri(request)
+        state = pending_signins.create(
+            native_app_port, native_app_public_key, redirect_uri
+        )
+        authorize = f"{GITLAB_URL.rstrip('/')}/oauth/authorize?" + urlencode(
+            {
+                "client_id": GITLAB_CLIENT_ID,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "state": state,
+                "scope": GITLAB_SCOPE,
+            }
+        )
+        return RedirectResponse(authorize, 302)
+
     return HTMLResponse(
         SIGNIN_PAGE.format(
             port=native_app_port,
@@ -358,26 +498,86 @@ async def native_app_signin(native_app_port: int, native_app_public_key: str):
 async def native_app_signin_complete(
     native_app_port: int, native_app_public_key: str, username: str
 ):
+    # Password-less fallback form. Disabled when GitLab OAuth is configured.
+    if gitlab_enabled():
+        return HTMLResponse("<h1>Sign-in is handled by GitLab</h1>", status_code=404)
+
     username = username.strip()
     if not username:
         return HTMLResponse("<h1>Username required</h1>", status_code=400)
 
     try:
-        public_key = parse_pkcs1_der_public_key(b64url_decode(native_app_public_key))
+        user = store.get_or_create_user(username)
+        return finish_signin(native_app_port, native_app_public_key, user)
     except Exception as exc:  # noqa: BLE001 — surface parse errors to the browser
         return HTMLResponse(f"<h1>Invalid public key</h1><p>{exc}</p>", status_code=400)
 
-    user = store.get_or_create_user(username)
-    ensure_collab_user(user)
-    token = store.issue_token(user)
-    encrypted = encrypt_for_client(public_key, token)
 
-    from urllib.parse import urlencode
+async def fetch_gitlab_identity(code: str, redirect_uri: str) -> dict:
+    """Exchange an OAuth code for a token and return the GitLab user profile."""
+    base = GITLAB_URL.rstrip("/")
+    async with httpx.AsyncClient(timeout=15) as client:
+        token_resp = await client.post(
+            f"{base}/oauth/token",
+            data={
+                "client_id": GITLAB_CLIENT_ID,
+                "client_secret": GITLAB_CLIENT_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": redirect_uri,
+            },
+        )
+        token_resp.raise_for_status()
+        access_token = token_resp.json()["access_token"]
 
-    query = urlencode(
-        {"user_id": str(user["legacy_user_id"]), "access_token": encrypted}
-    )
-    return RedirectResponse(f"http://127.0.0.1:{native_app_port}/?{query}", 302)
+        user_resp = await client.get(
+            f"{base}/api/v4/user",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        user_resp.raise_for_status()
+        return user_resp.json()
+
+
+@app.get("/auth/gitlab/callback")
+async def gitlab_callback(
+    request: Request,
+    state: str,
+    code: str = "",
+    error: str = "",
+    error_description: str = "",
+):
+    if error:
+        return HTMLResponse(
+            f"<h1>GitLab sign-in failed</h1><p>{error}: {error_description}</p>",
+            status_code=400,
+        )
+
+    record = pending_signins.take(state)
+    if record is None:
+        return HTMLResponse(
+            "<h1>Sign-in expired</h1><p>Please start again from Zed.</p>",
+            status_code=400,
+        )
+
+    try:
+        gl = await fetch_gitlab_identity(code, record["redirect_uri"])
+    except httpx.HTTPError as exc:
+        return HTMLResponse(
+            f"<h1>GitLab sign-in failed</h1><p>{exc}</p>", status_code=502
+        )
+
+    profile = {
+        "username": gl.get("username"),
+        "github_login": gl.get("username"),
+        "name": gl.get("name"),
+        "avatar_url": gl.get("avatar_url"),
+    }
+    user = store.get_or_create_user(f"gitlab:{gl['id']}", profile)
+
+    try:
+        return finish_signin(record["port"], record["public_key"], user)
+    except Exception as exc:  # noqa: BLE001
+        return HTMLResponse(f"<h1>Invalid public key</h1><p>{exc}</p>", status_code=400)
 
 
 @app.get("/native_app_signin_succeeded")
@@ -805,7 +1005,7 @@ class LookUpByGithubLoginBody(BaseModel):
 async def look_up_by_github_login(request: Request, body: LookUpByGithubLoginBody):
     if not check_internal_key(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    user = store.users.get(body.github_login)
+    user = store.user_by_github_login(body.github_login)
     return {"user": internal_user_json(user) if user else None}
 
 
@@ -821,8 +1021,9 @@ async def fuzzy_search_users(request: Request, body: FuzzySearchBody):
     query = body.query.lower()
     matches = [
         internal_user_json(user)
-        for username, user in store.users.items()
-        if query in username.lower()
+        for user in store.users.values()
+        if query in user["username"].lower()
+        or query in (user.get("github_login") or "").lower()
     ][: body.limit]
     return {"users": matches}
 
@@ -844,8 +1045,9 @@ async def fuzzy_search_channel_members(
     query = body.query.lower()
     matches = [
         internal_user_json(user)
-        for username, user in store.users.items()
-        if query in username.lower()
+        for user in store.users.values()
+        if query in user["username"].lower()
+        or query in (user.get("github_login") or "").lower()
     ][: body.limit]
     return {"channel_members": [], "users": matches}
 
@@ -891,6 +1093,8 @@ async def serve(args: argparse.Namespace) -> None:
 def main() -> None:
     global store, INTERNAL_API_KEY, COLLAB_RPC_URL, DEFAULT_USERNAME
     global COLLAB_DATABASE_URL, RELEASES_DIR, EXTENSIONS_DIR
+    global GITLAB_URL, GITLAB_CLIENT_ID, GITLAB_CLIENT_SECRET
+    global GITLAB_REDIRECT_URI, GITLAB_SCOPE
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0")
@@ -931,6 +1135,32 @@ def main() -> None:
         default=os.environ.get("EXTENSIONS_DIR", "extensions"),
         help="Directory with scraped extension archives + index.json for /extensions",
     )
+    parser.add_argument(
+        "--gitlab-url",
+        default=os.environ.get("GITLAB_URL", "https://gitlab.com"),
+        help="GitLab instance base URL (gitlab.com or a self-hosted instance)",
+    )
+    parser.add_argument(
+        "--gitlab-client-id",
+        default=os.environ.get("GITLAB_CLIENT_ID"),
+        help="OAuth application id; enables GitLab-backed sign-in when set with the secret",
+    )
+    parser.add_argument(
+        "--gitlab-client-secret",
+        default=os.environ.get("GITLAB_CLIENT_SECRET"),
+        help="OAuth application secret",
+    )
+    parser.add_argument(
+        "--gitlab-redirect-uri",
+        default=os.environ.get("GITLAB_REDIRECT_URI"),
+        help="OAuth callback URL registered on the GitLab app "
+        "(default: <request-base>/auth/gitlab/callback)",
+    )
+    parser.add_argument(
+        "--gitlab-scope",
+        default=os.environ.get("GITLAB_SCOPE", "read_user"),
+        help="OAuth scopes to request",
+    )
     args = parser.parse_args()
 
     cert_dir = Path(args.cert_dir)
@@ -944,6 +1174,15 @@ def main() -> None:
     RELEASES_DIR = Path(args.releases_dir)
     EXTENSIONS_DIR = Path(args.extensions_dir)
     DEFAULT_USERNAME = args.default_username
+    GITLAB_URL = args.gitlab_url
+    GITLAB_CLIENT_ID = args.gitlab_client_id
+    GITLAB_CLIENT_SECRET = args.gitlab_client_secret
+    GITLAB_REDIRECT_URI = args.gitlab_redirect_uri
+    GITLAB_SCOPE = args.gitlab_scope
+    if gitlab_enabled():
+        print(f"auth: GitLab OAuth via {GITLAB_URL}")
+    else:
+        print("auth: password-less username form (set GITLAB_CLIENT_ID/SECRET for GitLab)")
 
     asyncio.run(serve(args))
 

@@ -47,6 +47,14 @@ services:
       COLLAB_RPC_URL: "${COLLAB_RPC_URL:-}"
       RELEASES_DIR: "/releases"
       EXTENSIONS_DIR: "/extensions"
+      # GitLab-backed sign-in. Leave CLIENT_ID/SECRET empty to keep the
+      # password-less username form. GITLAB_URL may point at a self-hosted
+      # instance. REDIRECT_URI must match the callback registered on the GitLab
+      # OAuth app, e.g. https://zed.dondish.me:8443/auth/gitlab/callback.
+      GITLAB_URL: "${GITLAB_URL:-https://gitlab.com}"
+      GITLAB_CLIENT_ID: "${GITLAB_CLIENT_ID:-}"
+      GITLAB_CLIENT_SECRET: "${GITLAB_CLIENT_SECRET:-}"
+      GITLAB_REDIRECT_URI: "${GITLAB_REDIRECT_URI:-}"
     volumes:
       - ./certs:/certs:ro
       - clouddata:/data
