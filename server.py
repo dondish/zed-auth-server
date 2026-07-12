@@ -46,8 +46,9 @@ gitlab.com or self-hosted instance via GITLAB_URL) — the GitLab username, name
 and avatar become the Zed identity, keyed by the stable GitLab user id. Without
 GitLab configured it falls back to a password-less username form (typing a name
 creates that user), which is handy for local multi-instance testing. Users and
-tokens persist in data/state.json. Even with GitLab, this grants everyone a
-zed_free plan and admin — it is a self-hosted test backend, not a hardened one.
+tokens persist in Postgres when AUTH_DATABASE_URL is set (an `auth` schema),
+otherwise in data/state.json. Even with GitLab, this grants everyone a zed_free
+plan and admin — it is a self-hosted test backend, not a hardened one.
 
 Usage:
     python gen_certs.py --hostname zed.dondish.me   # once
@@ -154,11 +155,28 @@ def encrypt_for_client(public_key: rsa.RSAPublicKey, token: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# User + token store (persisted to a JSON file)
+# User + token store
+#
+# Two interchangeable backends with the same interface: JsonStore (a single
+# state.json file, the default for a standalone `python server.py`) and
+# PostgresStore (used when AUTH_DATABASE_URL is set — e.g. the docker-compose
+# stack). The user dict shape is identical across both.
+#
+# `identity` is the stable storage key: a bare username for the legacy form /
+# impersonation, or "gitlab:<id>" for an OAuth identity (so a GitLab user
+# survives a username change). `profile`, when given to get_or_create_user,
+# supplies/refreshes the display fields on each login.
 # ---------------------------------------------------------------------------
 
+# Fields refreshed from the OAuth profile on each subsequent login.
+_MUTABLE_USER_FIELDS = ("username", "github_login", "avatar_url", "name", "is_staff")
 
-class Store:
+
+def default_avatar(username: str) -> str:
+    return f"https://zed.dev/user_avatar/{username}.png"
+
+
+class JsonStore:
     def __init__(self, path: Path):
         self.path = path
         self.lock = threading.Lock()
@@ -166,8 +184,8 @@ class Store:
             state = json.loads(path.read_text(encoding="utf-8"))
         else:
             state = {"users": {}, "tokens": {}, "next_user_id": 1}
-        # users: {username: {...user record...}}
-        # tokens: {access_token: user_id}
+        # users: {identity: {...user record...}}
+        # tokens: {access_token: legacy_user_id}
         self.users: dict[str, dict] = state["users"]
         self.tokens: dict[str, int] = state["tokens"]
         self.next_user_id: int = state["next_user_id"]
@@ -189,14 +207,6 @@ class Store:
     def get_or_create_user(
         self, identity: str, profile: Optional[dict] = None
     ) -> dict:
-        """Look up (or create) a user by a stable identity key.
-
-        `identity` is the storage key: a bare username for the legacy form /
-        impersonation, or e.g. "gitlab:<id>" for an OAuth identity (so a GitLab
-        user survives a username change). `profile`, when given, supplies/
-        refreshes the display fields (username, github_login, avatar_url, name,
-        is_staff) on each login.
-        """
         profile = profile or {}
         with self.lock:
             user = self.users.get(identity)
@@ -208,8 +218,7 @@ class Store:
                     "metrics_id": str(uuid.uuid4()),
                     "username": username,
                     "github_login": profile.get("github_login") or username,
-                    "avatar_url": profile.get("avatar_url")
-                    or f"https://zed.dev/user_avatar/{username}.png",
+                    "avatar_url": profile.get("avatar_url") or default_avatar(username),
                     "name": profile.get("name"),
                     "is_staff": profile.get("is_staff", True),
                     "created_at": datetime.now(timezone.utc).isoformat(),
@@ -218,10 +227,12 @@ class Store:
                 self.next_user_id += 1
                 self._save()
             elif profile:
-                # Refresh mutable profile fields on subsequent logins.
                 changed = False
-                for field in ("username", "github_login", "avatar_url", "name", "is_staff"):
-                    if field in profile and profile[field] is not None and user.get(field) != profile[field]:
+                for field in _MUTABLE_USER_FIELDS:
+                    if (
+                        profile.get(field) is not None
+                        and user.get(field) != profile[field]
+                    ):
                         user[field] = profile[field]
                         changed = True
                 if changed:
@@ -240,6 +251,15 @@ class Store:
                 return user
         return None
 
+    def search_users(self, query: str, limit: int) -> list[dict]:
+        q = query.lower()
+        return [
+            user
+            for user in self.users.values()
+            if q in user["username"].lower()
+            or q in (user.get("github_login") or "").lower()
+        ][:limit]
+
     def issue_token(self, user: dict) -> str:
         token = random_access_token()
         with self.lock:
@@ -252,6 +272,164 @@ class Store:
         if legacy_id is None:
             return None
         return self.user_by_legacy_id(legacy_id)
+
+
+class PostgresStore:
+    """Postgres-backed store. Tables live in their own `auth` schema so they
+    coexist with collab's `public` tables in the same database."""
+
+    def __init__(self, dsn: str):
+        if psycopg is None:
+            raise SystemExit(
+                "AUTH_DATABASE_URL is set but psycopg is not installed "
+                "(pip install 'psycopg[binary,pool]')."
+            )
+        from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
+
+        self._dict_row = dict_row
+        self.pool = ConnectionPool(
+            dsn,
+            min_size=1,
+            max_size=8,
+            kwargs={"autocommit": True, "row_factory": dict_row},
+            open=True,
+        )
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        with self.pool.connection() as conn:
+            conn.execute("CREATE SCHEMA IF NOT EXISTS auth")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auth.users (
+                    identity       TEXT PRIMARY KEY,
+                    id             UUID NOT NULL DEFAULT gen_random_uuid(),
+                    legacy_user_id INTEGER GENERATED BY DEFAULT AS IDENTITY UNIQUE,
+                    metrics_id     UUID NOT NULL DEFAULT gen_random_uuid(),
+                    username       TEXT NOT NULL,
+                    github_login   TEXT,
+                    avatar_url     TEXT,
+                    name           TEXT,
+                    is_staff       BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auth.tokens (
+                    token          TEXT PRIMARY KEY,
+                    legacy_user_id INTEGER NOT NULL
+                        REFERENCES auth.users(legacy_user_id) ON DELETE CASCADE,
+                    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS users_github_login_idx "
+                "ON auth.users (github_login)"
+            )
+
+    @staticmethod
+    def _to_user(row: Optional[dict]) -> Optional[dict]:
+        if row is None:
+            return None
+        user = dict(row)
+        user.pop("identity", None)
+        user["id"] = str(user["id"])
+        user["metrics_id"] = str(user["metrics_id"])
+        # Callers expect created_at as an ISO-8601 string (see
+        # authenticated_user_json), matching JsonStore.
+        user["created_at"] = user["created_at"].isoformat()
+        return user
+
+    def get_or_create_user(
+        self, identity: str, profile: Optional[dict] = None
+    ) -> dict:
+        profile = profile or {}
+        with self.pool.connection() as conn, conn.transaction():
+            row = conn.execute(
+                "SELECT * FROM auth.users WHERE identity = %s FOR UPDATE",
+                (identity,),
+            ).fetchone()
+            if row is None:
+                username = profile.get("username") or identity
+                row = conn.execute(
+                    """
+                    INSERT INTO auth.users
+                        (identity, username, github_login, avatar_url, name, is_staff)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        identity,
+                        username,
+                        profile.get("github_login") or username,
+                        profile.get("avatar_url") or default_avatar(username),
+                        profile.get("name"),
+                        profile.get("is_staff", True),
+                    ),
+                ).fetchone()
+            elif profile:
+                updates = {
+                    field: profile[field]
+                    for field in _MUTABLE_USER_FIELDS
+                    if profile.get(field) is not None and row[field] != profile[field]
+                }
+                if updates:
+                    set_clause = ", ".join(f"{col} = %s" for col in updates)
+                    row = conn.execute(
+                        f"UPDATE auth.users SET {set_clause} "
+                        "WHERE identity = %s RETURNING *",
+                        (*updates.values(), identity),
+                    ).fetchone()
+            return self._to_user(row)
+
+    def user_by_legacy_id(self, legacy_id: int) -> Optional[dict]:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM auth.users WHERE legacy_user_id = %s", (legacy_id,)
+            ).fetchone()
+        return self._to_user(row)
+
+    def user_by_github_login(self, github_login: str) -> Optional[dict]:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM auth.users WHERE github_login = %s LIMIT 1",
+                (github_login,),
+            ).fetchone()
+        return self._to_user(row)
+
+    def search_users(self, query: str, limit: int) -> list[dict]:
+        like = f"%{query}%"
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM auth.users "
+                "WHERE username ILIKE %s OR github_login ILIKE %s "
+                "ORDER BY legacy_user_id LIMIT %s",
+                (like, like, limit),
+            ).fetchall()
+        return [self._to_user(r) for r in rows]
+
+    def issue_token(self, user: dict) -> str:
+        token = random_access_token()
+        with self.pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO auth.tokens (token, legacy_user_id) VALUES (%s, %s)",
+                (token, user["legacy_user_id"]),
+            )
+        return token
+
+    def user_for_token(self, token: str) -> Optional[dict]:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT u.* FROM auth.tokens t "
+                "JOIN auth.users u ON u.legacy_user_id = t.legacy_user_id "
+                "WHERE t.token = %s",
+                (token,),
+            ).fetchone()
+        return self._to_user(row)
 
 
 # ---------------------------------------------------------------------------
@@ -318,8 +496,8 @@ def get_authenticated_user_response(user: dict) -> dict:
 
 app = FastAPI(title="zed-auth-server", docs_url=None, redoc_url=None)
 
-# Filled in by main() before the servers start.
-store: Store = None  # type: ignore[assignment]
+# Filled in by main() before the servers start (JsonStore or PostgresStore).
+store = None  # type: ignore[assignment]
 INTERNAL_API_KEY = "internal-api-key-secret"
 COLLAB_RPC_URL: Optional[str] = None  # override; else derived from request host
 DEFAULT_USERNAME = "local"
@@ -1018,13 +1196,7 @@ class FuzzySearchBody(BaseModel):
 async def fuzzy_search_users(request: Request, body: FuzzySearchBody):
     if not check_internal_key(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    query = body.query.lower()
-    matches = [
-        internal_user_json(user)
-        for user in store.users.values()
-        if query in user["username"].lower()
-        or query in (user.get("github_login") or "").lower()
-    ][: body.limit]
+    matches = [internal_user_json(u) for u in store.search_users(body.query, body.limit)]
     return {"users": matches}
 
 
@@ -1042,13 +1214,7 @@ async def fuzzy_search_channel_members(
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     # Channel membership lives in collab's own database; we don't have it here.
     # Returning matching users with no member records keeps the search usable.
-    query = body.query.lower()
-    matches = [
-        internal_user_json(user)
-        for user in store.users.values()
-        if query in user["username"].lower()
-        or query in (user.get("github_login") or "").lower()
-    ][: body.limit]
+    matches = [internal_user_json(u) for u in store.search_users(body.query, body.limit)]
     return {"channel_members": [], "users": matches}
 
 
@@ -1107,6 +1273,12 @@ def main() -> None:
     )
     parser.add_argument("--cert-dir", default="certs")
     parser.add_argument("--data-dir", default="data")
+    parser.add_argument(
+        "--database-url",
+        default=os.environ.get("AUTH_DATABASE_URL"),
+        help="Postgres DSN for the user/token store (uses an `auth` schema). "
+        "When unset, users persist to <data-dir>/state.json.",
+    )
     parser.add_argument(
         "--internal-api-key",
         default=os.environ.get("ZED_CLOUD_INTERNAL_API_KEY", "internal-api-key-secret"),
@@ -1167,7 +1339,12 @@ def main() -> None:
     if not (cert_dir / "server.crt").exists():
         raise SystemExit(f"Missing {cert_dir}/server.crt — run gen_certs.py first.")
 
-    store = Store(Path(args.data_dir) / "state.json")
+    if args.database_url:
+        store = PostgresStore(args.database_url)
+        print("store: Postgres (auth schema)")
+    else:
+        store = JsonStore(Path(args.data_dir) / "state.json")
+        print(f"store: JSON file ({args.data_dir}/state.json)")
     INTERNAL_API_KEY = args.internal_api_key
     COLLAB_RPC_URL = args.collab_rpc_url
     COLLAB_DATABASE_URL = args.collab_database_url

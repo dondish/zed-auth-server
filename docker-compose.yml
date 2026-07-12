@@ -40,6 +40,11 @@ services:
       dockerfile: Dockerfile
     environment:
       ZED_CLOUD_INTERNAL_API_KEY: "${INTERNAL_API_KEY:-internal-api-key-secret}"
+      # User/token store. Uses its own `auth` schema in the same Postgres, so it
+      # coexists with collab's `public` tables. Unset it to fall back to
+      # /data/state.json.
+      AUTH_DATABASE_URL: "postgres://postgres:postgres@postgres:5432/zed"
+      # Mirrors signed-in users into collab's `public.users` (FK constraints).
       COLLAB_DATABASE_URL: "postgres://postgres:postgres@postgres:5432/zed"
       # Where GET /rpc sends clients for the collab websocket. Defaults to
       # http://<request-host>:8080/rpc; override if clients reach collab
