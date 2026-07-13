@@ -32,6 +32,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from blobstore import EXTENSIONS_INDEX_KEY, BlobStore
+
 UPSTREAM = "https://api.zed.dev"
 # The client's CURRENT_SCHEMA_VERSION (crates/extension_host). Extensions
 # published against a newer schema than the client understands are skipped.
@@ -111,7 +113,15 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     index_path = out_dir / "index.json"
-    index = json.loads(index_path.read_text()) if index_path.exists() else {}
+
+    # When S3 is configured, the authoritative index lives in the bucket.
+    blobs = BlobStore.from_env()
+    if blobs is not None:
+        blobs.ensure_bucket()
+        index = blobs.get_json(EXTENSIONS_INDEX_KEY) or {}
+        print(f"uploading to S3 bucket '{blobs.bucket}'")
+    else:
+        index = json.loads(index_path.read_text()) if index_path.exists() else {}
     extensions = index.setdefault("extensions", {})
 
     for meta in catalog:
@@ -120,18 +130,29 @@ def main() -> None:
         print(f"{ext_id} @ {version}")
         archive = f"{ext_id}-{version}.tar.gz"
         url = f"{UPSTREAM}/extensions/{ext_id}/download"
-        download(url, out_dir / archive)
+        dest = out_dir / archive
+        download(url, dest)
         entry = dict(meta)
         entry["archive"] = archive
+        entry["size"] = dest.stat().st_size
+        if blobs is not None:
+            s3_key = f"extensions/{ext_id}/{version}/archive.tar.gz"
+            blobs.put_file(s3_key, dest, "application/gzip")
+            entry["key"] = s3_key
         # Replace any prior entry for this exact version; keep others.
         versions = [e for e in extensions.get(ext_id, []) if e["version"] != version]
         versions.append(entry)
         versions.sort(key=lambda e: e["version"])
         extensions[ext_id] = versions
 
-    index_path.write_text(json.dumps(index, indent=2))
     total = sum(len(v) for v in extensions.values())
-    print(f"\nWrote {index_path} ({len(extensions)} extensions, {total} versions)")
+    if blobs is not None:
+        blobs.put_json(EXTENSIONS_INDEX_KEY, index)
+        print(f"\nWrote s3://{blobs.bucket}/{EXTENSIONS_INDEX_KEY} "
+              f"({len(extensions)} extensions, {total} versions)")
+    else:
+        index_path.write_text(json.dumps(index, indent=2))
+        print(f"\nWrote {index_path} ({len(extensions)} extensions, {total} versions)")
 
 
 if __name__ == "__main__":

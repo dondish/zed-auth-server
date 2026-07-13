@@ -60,12 +60,19 @@ services:
       GITLAB_CLIENT_ID: "${GITLAB_CLIENT_ID:-}"
       GITLAB_CLIENT_SECRET: "${GITLAB_CLIENT_SECRET:-}"
       GITLAB_REDIRECT_URI: "${GITLAB_REDIRECT_URI:-}"
+      # Releases + extensions are stored in S3/MinIO; the server streams the
+      # bytes back through its own HTTPS listener (MinIO isn't exposed to
+      # clients). Unset S3_ENDPOINT_URL/S3_BUCKET to use the local dir mounts.
+      S3_ENDPOINT_URL: "http://minio:9000"
+      S3_BUCKET: "${S3_BUCKET:-zed-assets}"
+      S3_REGION: "${S3_REGION:-us-east-1}"
+      S3_ACCESS_KEY_ID: "${MINIO_ROOT_USER:-minioadmin}"
+      S3_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD:-minioadmin}"
     volumes:
       - ./certs:/certs:ro
       - clouddata:/data
-      # Scraped release installers served by the /releases auto-update API.
+      # Local-mode fallback mounts (unused when S3 is configured above).
       - ./releases:/releases:ro
-      # Scraped extension archives served by the /extensions API.
       - ./extensions:/extensions:ro
     ports:
       - "8443:8443"   # client-facing HTTPS  (Zed's server_url)
@@ -73,6 +80,41 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks: [zednet]
+
+  # S3-compatible object storage for release installers + extension archives.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-minioadmin}"
+    volumes:
+      - miniodata:/data
+    ports:
+      - "9000:9000"   # S3 API (used by scrape_*.py from the host)
+      - "9001:9001"   # web console
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [zednet]
+
+  # One-shot: create the bucket on first boot, then exit.
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 '${MINIO_ROOT_USER:-minioadmin}' '${MINIO_ROOT_PASSWORD:-minioadmin}' &&
+      mc mb --ignore-existing local/${S3_BUCKET:-zed-assets} &&
+      echo 'bucket ready';
+      "
     networks: [zednet]
 
   collab:
@@ -101,6 +143,7 @@ services:
 volumes:
   pgdata:
   clouddata:
+  miniodata:
 
 networks:
   zednet:

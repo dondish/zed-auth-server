@@ -81,8 +81,11 @@ from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
+    StreamingResponse,
 )
 from pydantic import BaseModel
+
+from blobstore import BlobStore, EXTENSIONS_INDEX_KEY, RELEASES_INDEX_KEY
 
 try:
     import psycopg  # optional; only needed when COLLAB_DATABASE_URL is set
@@ -511,6 +514,10 @@ RELEASES_DIR: Path = Path("releases")
 # Directory holding scraped extension archives + index.json (see
 # scrape_extensions.py). Served by the /extensions API.
 EXTENSIONS_DIR: Path = Path("extensions")
+# When configured (S3_ENDPOINT_URL / S3_BUCKET), releases and extensions are
+# read from S3 / MinIO instead of the local *_DIR paths above. The server still
+# streams the bytes through its own HTTPS listener.
+BLOBS: Optional[BlobStore] = None
 
 # --- GitLab OAuth ----------------------------------------------------------
 # When GITLAB_CLIENT_ID and GITLAB_CLIENT_SECRET are set, sign-in is backed by
@@ -789,14 +796,45 @@ async def rpc_redirect(request: Request):
 # and host the binaries ourselves via /releases/download/... below.
 
 
+# Small TTL cache so the index isn't re-fetched from S3 on every request.
+_index_cache: dict[str, tuple[float, dict]] = {}
+_INDEX_TTL = 30.0
+
+
+def _load_index(local_path: Path, s3_key: str) -> dict:
+    if BLOBS is None:
+        if not local_path.exists():
+            return {}
+        try:
+            return json.loads(local_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    now = time.monotonic()
+    cached = _index_cache.get(s3_key)
+    if cached and now - cached[0] < _INDEX_TTL:
+        return cached[1]
+    data = BLOBS.get_json(s3_key) or {}
+    _index_cache[s3_key] = (now, data)
+    return data
+
+
+def _stream_blob(key: str, filename: Optional[str], media_type: str):
+    """Stream an object from S3 back through this server."""
+    result = BLOBS.open_stream(key)
+    if result is None:
+        return JSONResponse({"error": "asset file missing"}, status_code=404)
+    chunks, length, _content_type = result
+    headers = {}
+    if length:
+        headers["Content-Length"] = str(length)
+    if filename:
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return StreamingResponse(chunks, media_type=media_type, headers=headers)
+
+
 def load_release_index() -> dict:
-    path = RELEASES_DIR / "index.json"
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
+    return _load_index(RELEASES_DIR / "index.json", RELEASES_INDEX_KEY)
 
 
 def _semver_key(version: str) -> tuple:
@@ -848,8 +886,11 @@ async def release_download(
     # Guard against path traversal: only serve files named in the index.
     key = f"{channel}/{os}/{arch}/{asset}"
     entries = load_release_index().get(key, [])
-    if not any(e["file"] == filename for e in entries):
+    entry = next((e for e in entries if e["file"] == filename), None)
+    if entry is None:
         return JSONResponse({"error": "unknown asset"}, status_code=404)
+    if BLOBS is not None:
+        return _stream_blob(entry["key"], filename, "application/octet-stream")
     path = RELEASES_DIR / filename
     if not path.exists():
         return JSONResponse({"error": "asset file missing"}, status_code=404)
@@ -875,18 +916,14 @@ async def release_download(
 
 
 def load_extension_index() -> dict:
-    path = EXTENSIONS_DIR / "index.json"
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8")).get("extensions", {})
-    except (json.JSONDecodeError, OSError):
-        return {}
+    return _load_index(
+        EXTENSIONS_DIR / "index.json", EXTENSIONS_INDEX_KEY
+    ).get("extensions", {})
 
 
 # Fields that are internal to the mirror and must not leak into API responses
 # (the client deserializes into a strict ExtensionMetadata struct).
-_EXT_INTERNAL_FIELDS = ("archive",)
+_EXT_INTERNAL_FIELDS = ("archive", "key", "size")
 
 
 def _public_metadata(entry: dict) -> dict:
@@ -963,6 +1000,11 @@ async def extension_versions(extension_id: str):
 
 def _serve_extension_archive(extension_id: str, entry: dict):
     archive = entry.get("archive")
+    if BLOBS is not None:
+        key = entry.get("key")
+        if not key:
+            return JSONResponse({"error": "no archive for version"}, status_code=404)
+        return _stream_blob(key, archive, "application/gzip")
     if not archive:
         return JSONResponse({"error": "no archive for version"}, status_code=404)
     path = EXTENSIONS_DIR / archive
@@ -1059,8 +1101,11 @@ async def index_page(request: Request):
         latest = max(entries, key=lambda e: _semver_key(e["version"]))["version"]
         rows = []
         for entry in sorted(entries, key=lambda e: _semver_key(e["version"]), reverse=True):
-            file_path = RELEASES_DIR / entry["file"]
-            size = _human_size(file_path.stat().st_size) if file_path.exists() else "—"
+            if entry.get("size"):
+                size = _human_size(entry["size"])
+            else:
+                file_path = RELEASES_DIR / entry["file"]
+                size = _human_size(file_path.stat().st_size) if file_path.exists() else "—"
             tag = '<span class="tag">latest</span>' if entry["version"] == latest else ""
             dl = f"{base}/releases/download/{channel}/{os_}/{arch}/{asset}/{entry['file']}"
             rows.append(
@@ -1258,7 +1303,7 @@ async def serve(args: argparse.Namespace) -> None:
 
 def main() -> None:
     global store, INTERNAL_API_KEY, COLLAB_RPC_URL, DEFAULT_USERNAME
-    global COLLAB_DATABASE_URL, RELEASES_DIR, EXTENSIONS_DIR
+    global COLLAB_DATABASE_URL, RELEASES_DIR, EXTENSIONS_DIR, BLOBS
     global GITLAB_URL, GITLAB_CLIENT_ID, GITLAB_CLIENT_SECRET
     global GITLAB_REDIRECT_URI, GITLAB_SCOPE
 
@@ -1350,6 +1395,11 @@ def main() -> None:
     COLLAB_DATABASE_URL = args.collab_database_url
     RELEASES_DIR = Path(args.releases_dir)
     EXTENSIONS_DIR = Path(args.extensions_dir)
+    BLOBS = BlobStore.from_env()
+    if BLOBS is not None:
+        print(f"assets: S3 bucket '{BLOBS.bucket}' (releases + extensions)")
+    else:
+        print("assets: local dirs (set S3_ENDPOINT_URL/S3_BUCKET for S3/MinIO)")
     DEFAULT_USERNAME = args.default_username
     GITLAB_URL = args.gitlab_url
     GITLAB_CLIENT_ID = args.gitlab_client_id

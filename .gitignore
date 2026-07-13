@@ -8,6 +8,8 @@ releases/
 
 # Scraped extension archives (regenerate with scrape_extensions.py)
 extensions/
+extensions.zip
+*.zip
 
 # Python
 __pycache__/

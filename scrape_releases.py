@@ -18,6 +18,8 @@ import json
 import urllib.request
 from pathlib import Path
 
+from blobstore import RELEASES_INDEX_KEY, BlobStore
+
 UPSTREAM = "https://cloud.zed.dev"
 DEFAULT_VERSIONS = ["1.10.2", "1.10.1", "1.10.0"]
 # GitHub's asset CDN returns 403 for requests without a browser-like UA.
@@ -80,7 +82,14 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     index_path = out_dir / "index.json"
 
-    index = json.loads(index_path.read_text()) if index_path.exists() else {}
+    # When S3 is configured, the authoritative index lives in the bucket.
+    blobs = BlobStore.from_env()
+    if blobs is not None:
+        blobs.ensure_bucket()
+        index = blobs.get_json(RELEASES_INDEX_KEY) or {}
+        print(f"uploading to S3 bucket '{blobs.bucket}'")
+    else:
+        index = json.loads(index_path.read_text()) if index_path.exists() else {}
 
     # Key groups entries by everything except version.
     key = f"{args.channel}/{args.os_}/{args.arch}/{args.asset}"
@@ -92,16 +101,28 @@ def main() -> None:
         real_version = meta["version"]
         ext = ext_for(args.os_, args.asset)
         filename = f"{args.asset}-{real_version}-{args.os_}-{args.arch}.{ext}"
-        download(meta["url"], out_dir / filename)
-        entries[real_version] = {
+        dest = out_dir / filename
+        download(meta["url"], dest)
+        entry = {
             "version": real_version,
             "file": filename,
             "source_url": meta["url"],
+            "size": dest.stat().st_size,
         }
+        if blobs is not None:
+            s3_key = f"releases/{key}/{real_version}/{filename}"
+            blobs.put_file(s3_key, dest, "application/octet-stream")
+            entry["key"] = s3_key
+        entries[real_version] = entry
 
     index[key] = sorted(entries.values(), key=lambda e: e["version"])
-    index_path.write_text(json.dumps(index, indent=2))
-    print(f"\nWrote {index_path} ({sum(len(v) for v in index.values())} entries total)")
+    if blobs is not None:
+        blobs.put_json(RELEASES_INDEX_KEY, index)
+        print(f"\nWrote s3://{blobs.bucket}/{RELEASES_INDEX_KEY} "
+              f"({sum(len(v) for v in index.values())} entries total)")
+    else:
+        index_path.write_text(json.dumps(index, indent=2))
+        print(f"\nWrote {index_path} ({sum(len(v) for v in index.values())} entries total)")
 
 
 if __name__ == "__main__":

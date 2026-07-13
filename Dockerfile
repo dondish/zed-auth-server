@@ -6,7 +6,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py .
+COPY server.py blobstore.py ./
 
 # Certs and persistent state are provided at runtime via volumes.
 #   /certs — server.crt / server.key (generate with gen_certs.py on the host)
