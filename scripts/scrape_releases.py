@@ -8,9 +8,9 @@ The index is keyed by (channel, os, arch, asset) -> list of {version, file}.
 server.py resolves "latest" by picking the highest semver in the matching list.
 
 Usage:
-    python scrape_releases.py                          # default: last 3 stable
-    python scrape_releases.py --versions 1.10.2 1.9.0
-    python scrape_releases.py --os windows --arch x86_64 --asset zed
+    python -m scripts.scrape_releases                          # default: last 3 stable
+    python -m scripts.scrape_releases --versions 1.10.2 1.9.0
+    python -m scripts.scrape_releases --os windows --arch x86_64 --asset zed
 """
 
 import argparse
@@ -18,7 +18,7 @@ import json
 import urllib.request
 from pathlib import Path
 
-from blobstore import RELEASES_INDEX_KEY, BlobStore
+from server.blobstore import RELEASES_INDEX_KEY, BlobStore
 
 UPSTREAM = "https://cloud.zed.dev"
 DEFAULT_VERSIONS = ["1.10.2", "1.10.1", "1.10.0"]

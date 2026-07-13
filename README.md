@@ -29,7 +29,20 @@ signed-in user a `zed_free` plan and admin — not a hardened one.
 | `GET /extensions/{id}[/{version}]/download` | Zed extension store | serves the extension's `archive.tar.gz` |
 | `POST /internal/users/*`, `/internal/channel_members/*` | collab | user directory (Bearer-authenticated internal API) |
 
-Users and tokens persist in `data/state.json`.
+Users and tokens persist in `data/state.json` (or Postgres — see below).
+
+## Project layout
+
+```
+server/     the app package — run with `python -m server`
+            app.py (assembly) + routers (auth/client/internal/releases/extensions)
+            + config, stores, schemas, crypto, blobstore, assets, collab_db
+scripts/    utilities — `python -m scripts.gen_certs`,
+            `python -m scripts.scrape_releases`, `python -m scripts.scrape_extensions`
+tests/      `python tests/test_server.py` (end-to-end against a live instance)
+```
+
+Run everything from the repo root so the `server` / `scripts` packages resolve.
 
 ## Authentication (GitLab OAuth)
 
@@ -82,8 +95,8 @@ web console is at `http://localhost:9001` (`minioadmin`/`minioadmin` by default)
 ```sh
 export S3_ENDPOINT_URL=http://localhost:9000 S3_BUCKET=zed-assets
 export S3_ACCESS_KEY_ID=minioadmin S3_SECRET_ACCESS_KEY=minioadmin
-python scrape_extensions.py --ids toml dockerfile
-python scrape_releases.py --versions 1.10.2
+python -m scripts.scrape_extensions --ids toml dockerfile
+python -m scripts.scrape_releases --versions 1.10.2
 ```
 
 ## Auto-updates (releases API)
@@ -93,17 +106,17 @@ Zed's auto-updater ([`crates/auto_update`](../zed/crates/auto_update)) calls
 `{"version": "..", "url": ".."}`, then downloads `url` (on Windows, it runs the
 result as an installer). `version` may be `latest`.
 
-`scrape_releases.py` queries Zed's real endpoint (`cloud.zed.dev`), downloads
+`scripts/scrape_releases.py` queries Zed's real endpoint (`cloud.zed.dev`), downloads
 the installer for each version, and stores it (S3 or `releases/`) with a
 `releases/index.json` manifest. The server then hosts those binaries itself, so
 updates come from this machine, not GitHub.
 
 ```sh
 # Default: last 3 stable Windows x86_64 builds (~83MB each)
-python scrape_releases.py
+python -m scripts.scrape_releases
 
 # Other platforms / versions:
-python scrape_releases.py --os macos --arch aarch64 --versions 1.10.2 1.10.1
+python -m scripts.scrape_releases --os macos --arch aarch64 --versions 1.10.2 1.10.1
 ```
 
 The server resolves `latest` to the highest scraped semver for the requested
@@ -127,14 +140,14 @@ HTTPS listener (8443), not the internal collab port. It calls:
 The JSON routes return `{"data": [ExtensionMetadata]}`, matching
 `cloud_api_types::GetExtensionsResponse`.
 
-`scrape_extensions.py` mirrors extensions from Zed's real API (`api.zed.dev`)
+`scripts/scrape_extensions.py` mirrors extensions from Zed's real API (`api.zed.dev`)
 into `extensions/` (git-ignored, regenerate with the scraper):
 
 ```sh
-python scrape_extensions.py                     # small curated default set
-python scrape_extensions.py --filter toml       # everything matching a term
-python scrape_extensions.py --ids toml dockerfile nix
-python scrape_extensions.py --all --limit 50    # top 50 by download count
+python -m scripts.scrape_extensions                     # small curated default set
+python -m scripts.scrape_extensions --filter toml       # everything matching a term
+python -m scripts.scrape_extensions --ids toml dockerfile nix
+python -m scripts.scrape_extensions --all --limit 50    # top 50 by download count
 ```
 
 Only mirrored extensions appear in the in-app store; install/update works
@@ -146,7 +159,7 @@ entirely from this machine.
 pip install -r requirements.txt
 
 # 1. Generate a self-signed CA + server certificate
-python gen_certs.py --hostname zed.dondish.me
+python -m scripts.gen_certs --hostname zed.dondish.me
 
 # 2. Trust the CA (Windows, elevated prompt):
 certutil -addstore -f Root certs\ca.crt
@@ -154,7 +167,7 @@ certutil -addstore -f Root certs\ca.crt
 #    (Linux: copy to /usr/local/share/ca-certificates and run update-ca-certificates)
 
 # 3. Make the hostname resolve (e.g. hosts-file entry) and run
-python server.py
+python -m server
 ```
 
 Listeners:
@@ -182,7 +195,7 @@ Zed's collab server built from `../zed`.
 ```sh
 # 0. The Zed repo must be checked out at ../zed (sibling of this project).
 # 1. Generate certs (once)
-python gen_certs.py --hostname zed.dondish.me
+python -m scripts.gen_certs --hostname zed.dondish.me
 
 # 2. Build + start everything (first build of collab is very heavy — it
 #    compiles the whole Zed workspace; expect 20-40 min and several GB)
@@ -238,7 +251,7 @@ self-signed CA.
 
 ### Standalone (no Docker)
 
-You can still run just the auth server: `python server.py`. Pair it with a
+You can still run just the auth server: `python -m server`. Pair it with a
 collab server started however you like (`cargo run -p collab serve all`) as
 long as collab reaches this server at `localhost:8787` and
 `ZED_CLOUD_INTERNAL_API_KEY` matches `--internal-api-key`. Pass
@@ -268,7 +281,7 @@ long as collab reaches this server at `localhost:8787` and
 ## Tests
 
 ```sh
-python test_server.py
+python tests/test_server.py
 ```
 
 Simulates the Zed client (keypair generation, PKCS#1 public key, OAEP token

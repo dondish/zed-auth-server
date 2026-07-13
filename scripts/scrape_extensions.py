@@ -20,10 +20,10 @@ id maps to a single-version list here (which is all the client needs to
 install / update).
 
 Usage:
-    python scrape_extensions.py                       # default curated set
-    python scrape_extensions.py --filter toml         # everything matching "toml"
-    python scrape_extensions.py --ids toml dockerfile git-firefly
-    python scrape_extensions.py --all --limit 50      # top 50 by downloads
+    python -m scripts.scrape_extensions                       # default curated set
+    python -m scripts.scrape_extensions --filter toml         # everything matching "toml"
+    python -m scripts.scrape_extensions --ids toml dockerfile git-firefly
+    python -m scripts.scrape_extensions --all --limit 50      # top 50 by downloads
 """
 
 import argparse
@@ -32,7 +32,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from blobstore import EXTENSIONS_INDEX_KEY, BlobStore
+from server.blobstore import EXTENSIONS_INDEX_KEY, BlobStore
 
 UPSTREAM = "https://api.zed.dev"
 # The client's CURRENT_SCHEMA_VERSION (crates/extension_host). Extensions

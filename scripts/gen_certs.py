@@ -1,11 +1,11 @@
 """Generate a self-signed CA and a server certificate signed by that CA.
 
 Usage:
-    python gen_certs.py [--hostname localhost] [--out-dir certs]
+    python -m scripts.gen_certs [--hostname localhost] [--out-dir certs]
 
 After running this, import certs/ca.crt into your OS/browser trust store so
 that clients (including the `zed` binary and your browser) trust the server
-certificate served by server.py.
+certificate served by `python -m server`.
 """
 
 import argparse

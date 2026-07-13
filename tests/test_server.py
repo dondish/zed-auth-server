@@ -1,6 +1,6 @@
 """End-to-end test: simulates a Zed client and a collab server against server.py.
 
-Run:  python test_server.py
+Run (from the repo root):  python tests/test_server.py
 """
 
 import base64
@@ -46,7 +46,7 @@ def request(url, method="GET", headers=None, body=None, follow_redirects=False):
 
 def main():
     proc = subprocess.Popen(
-        [sys.executable, "server.py"],
+        [sys.executable, "-m", "server"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
