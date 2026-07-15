@@ -15,6 +15,7 @@ grouped into routers:
   internal_routes   collab's Bearer-authenticated user directory (/internal/*)
   releases_routes   auto-update API + installer web UI (/, /releases/*)
   extensions_routes extension store (/extensions/*)
+  registry_routes   ACP agent registry (/registry/*)
 
 Runtime configuration lives in `config.config`, populated by server.main().
 """
@@ -26,6 +27,7 @@ from . import (
     client_routes,
     extensions_routes,
     internal_routes,
+    registry_routes,
     releases_routes,
 )
 
@@ -35,6 +37,7 @@ app.include_router(auth_routes.router)
 app.include_router(client_routes.router)
 app.include_router(internal_routes.router)
 app.include_router(extensions_routes.router)
+app.include_router(registry_routes.router)
 # Releases router owns "/" (the web UI); include it last.
 app.include_router(releases_routes.router)
 

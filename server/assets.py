@@ -13,7 +13,7 @@ from typing import Optional
 
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .blobstore import EXTENSIONS_INDEX_KEY, RELEASES_INDEX_KEY
+from .blobstore import ACP_INDEX_KEY, EXTENSIONS_INDEX_KEY, RELEASES_INDEX_KEY
 from .config import config
 
 # Small TTL cache so the index isn't re-fetched from S3 on every request.
@@ -54,6 +54,11 @@ def load_extension_index() -> dict:
     return _load_index(
         config.extensions_dir / "index.json", EXTENSIONS_INDEX_KEY
     ).get("extensions", {})
+
+
+def load_acp_index() -> dict:
+    """The mirrored ACP registry: {"version": str, "agents": {<id>: entry}}."""
+    return _load_index(config.acp_dir / "index.json", ACP_INDEX_KEY)
 
 
 def stream_blob(key: str, filename: Optional[str], media_type: str):

@@ -20,6 +20,9 @@ Bucket layout:
     releases/<channel>/<os>/<arch>/<asset>/<version>/<filename>
     extensions/index.json
     extensions/<id>/<version>/archive.tar.gz
+    acp/index.json
+    acp/<id>/<version>/<platform>/<filename>          # ACP registry agents
+    acp/<id>/icon.svg
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from typing import Iterator, Optional
 
 RELEASES_INDEX_KEY = "releases/index.json"
 EXTENSIONS_INDEX_KEY = "extensions/index.json"
+ACP_INDEX_KEY = "acp/index.json"
 
 _CHUNK = 1 << 20  # 1 MiB streaming chunks
 

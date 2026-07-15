@@ -45,6 +45,13 @@ def main() -> None:
         help="Hostname the server certificate should be valid for (default: localhost)",
     )
     parser.add_argument(
+        "--alt-names",
+        nargs="*",
+        default=[],
+        help="Extra DNS names to add to the certificate's SAN. Add "
+        "cdn.agentclientprotocol.com here to self-host the ACP registry.",
+    )
+    parser.add_argument(
         "--out-dir",
         default="certs",
         help="Directory to write generated keys/certs into (default: ./certs)",
@@ -102,9 +109,14 @@ def main() -> None:
         [x509.NameAttribute(NameOID.COMMON_NAME, args.hostname)]
     )
 
-    san_entries: list[x509.GeneralName] = [x509.DNSName(args.hostname)]
+    dns_names = [args.hostname]
     if args.hostname != "localhost":
-        san_entries.append(x509.DNSName("localhost"))
+        dns_names.append("localhost")
+    for name in args.alt_names:
+        if name not in dns_names:
+            dns_names.append(name)
+
+    san_entries: list[x509.GeneralName] = [x509.DNSName(n) for n in dns_names]
     try:
         san_entries.append(x509.IPAddress(ipaddress.ip_address(args.hostname)))
     except ValueError:
@@ -152,7 +164,7 @@ def main() -> None:
     write_cert(out_dir / "server.crt", server_cert)
 
     print(f"Wrote CA key/cert and server key/cert to {out_dir}/")
-    print(f"Server certificate is valid for: {args.hostname}, localhost, 127.0.0.1")
+    print(f"Server certificate is valid for: {', '.join(dns_names)}, 127.0.0.1")
     print()
     print("Next steps:")
     print(f"  1. Trust {out_dir / 'ca.crt'} in your OS trust store (see README instructions).")

@@ -31,6 +31,7 @@ class Config:
         # Local-mode asset dirs (used only when S3 is not configured).
         self.releases_dir: Path = Path("releases")
         self.extensions_dir: Path = Path("extensions")
+        self.acp_dir: Path = Path("acp")
         # S3/MinIO store for releases + extensions; None = local dirs.
         self.blobs: Optional["BlobStore"] = None
         # GitLab OAuth. Sign-in is GitLab-backed when client id + secret are

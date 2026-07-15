@@ -14,6 +14,9 @@ extensions/
 extensions.zip
 *.zip
 
+# Mirrored ACP registry agents (regenerate with scrape_acp_registry.py)
+acp/
+
 # Python
 __pycache__/
 *.pyc

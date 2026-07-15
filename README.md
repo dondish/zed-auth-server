@@ -27,6 +27,8 @@ signed-in user a `zed_free` plan and admin — not a hardened one.
 | `GET /releases/download/...` | Zed auto-updater | serves the installer binary itself |
 | `GET /extensions`, `/extensions/updates`, `/extensions/{id}` | Zed extension store | catalog / update-check / versions (`{data:[…]}`) |
 | `GET /extensions/{id}[/{version}]/download` | Zed extension store | serves the extension's `archive.tar.gz` |
+| `GET /registry/v1/latest/registry.json` | Zed ACP agent registry | catalog of installable external (ACP) agents |
+| `GET /registry/archives/{id}/{version}/{platform}/{file}`, `/registry/icons/{id}` | Zed ACP agent registry | serves an agent's binary archive / icon |
 | `POST /internal/users/*`, `/internal/channel_members/*` | collab | user directory (Bearer-authenticated internal API) |
 
 Users and tokens persist in `data/state.json` (or Postgres — see below).
@@ -38,7 +40,8 @@ server/     the app package — run with `python -m server`
             app.py (assembly) + routers (auth/client/internal/releases/extensions)
             + config, stores, schemas, crypto, blobstore, assets, collab_db
 scripts/    utilities — `python -m scripts.gen_certs`,
-            `python -m scripts.scrape_releases`, `python -m scripts.scrape_extensions`
+            `python -m scripts.scrape_releases`, `python -m scripts.scrape_extensions`,
+            `python -m scripts.scrape_acp_registry`
 tests/      `python tests/test_server.py` (end-to-end against a live instance)
 ```
 
@@ -85,6 +88,9 @@ releases/index.json
 releases/<channel>/<os>/<arch>/<asset>/<version>/<filename>
 extensions/index.json
 extensions/<id>/<version>/archive.tar.gz          # matches collab's convention
+acp/index.json
+acp/<id>/<version>/<platform>/<archive>           # ACP registry agent binaries
+acp/<id>/icon.svg
 ```
 
 The scrapers upload to S3 when `S3_ENDPOINT_URL`/`S3_BUCKET` are set (run them
@@ -152,6 +158,57 @@ python -m scripts.scrape_extensions --all --limit 50    # top 50 by download cou
 
 Only mirrored extensions appear in the in-app store; install/update works
 entirely from this machine.
+
+## Agents (ACP registry)
+
+As of Zed `v1.5.0`, external agents (Claude Code, Gemini, Codex, …) are
+installed from the **ACP registry** rather than as extensions. Zed's
+`AgentRegistryStore` ([`crates/project/src/agent_registry_store.rs`](../zed/crates/project/src/agent_registry_store.rs))
+fetches a single `registry.json`, then downloads the selected agent's
+per-platform `archive` (binary agents) or runs its `npx` package.
+
+This server mirrors that registry the same way it mirrors the extension store:
+`scripts/scrape_acp_registry.py` pulls the real index from
+`cdn.agentclientprotocol.com`, downloads each selected agent's binary archive +
+icon into S3/`acp/`, and the server serves `registry.json` — rewriting the
+`archive`/`icon` URLs back at its own base URL so clients only ever talk to this
+machine. `npx`-based agents install straight from npm, so only their metadata is
+mirrored.
+
+```sh
+python -m scripts.scrape_acp_registry                    # all agents, host platform
+python -m scripts.scrape_acp_registry --ids gemini codex
+python -m scripts.scrape_acp_registry --platforms all    # every platform's binary
+```
+
+### Pointing Zed at this registry
+
+Unlike the extension and cloud APIs, the registry URL is **not** derived from
+`server_url` — it is hardcoded in the client to
+`https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`
+(`REGISTRY_URL` in `agent_registry_store.rs`). So there are two ways to make Zed
+install from this server:
+
+1. **Intercept the CDN host (no client patch).** Serve this host from this
+   machine — add `cdn.agentclientprotocol.com` to the certificate's SAN and to
+   your hosts file, and serve it on port 443 (the hardcoded URL has no port):
+
+   ```sh
+   python -m scripts.gen_certs --hostname zed.dondish.me \
+       --alt-names cdn.agentclientprotocol.com
+   # hosts file:  127.0.0.1  cdn.agentclientprotocol.com
+   python -m server --port 443           # or reverse-proxy 443 → 8443
+   ```
+
+   The registry fetch uses the OS trust store (like the extension API), so the
+   self-signed CA works once trusted — no `webpki-roots` caveat here.
+
+2. **Patch `REGISTRY_URL`** in your `../zed` checkout to point at
+   `https://zed.dondish.me:8443/registry/v1/latest/registry.json`. Then it rides
+   the existing client-facing listener and cert with no extra host or port.
+
+Either way the mirrored `archive`/`icon` URLs point back at whatever host:port
+Zed used to reach the registry, so the same `acp/index.json` works for both.
 
 ## Setup
 
@@ -271,6 +328,7 @@ long as collab reaches this server at `localhost:8787` and
 --default-username local  username prefilled on the sign-in form (fallback only)
 --releases-dir releases   scraped installers + index.json for /releases
 --extensions-dir extensions  scraped extension archives + index.json for /extensions
+--acp-dir acp             mirrored ACP agent archives + index.json for /registry
 --gitlab-url https://gitlab.com   GitLab instance (custom / self-hosted ok)
 --gitlab-client-id ...    OAuth app id (enables GitLab sign-in with the secret)
 --gitlab-client-secret ...  OAuth app secret

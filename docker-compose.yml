@@ -52,6 +52,7 @@ services:
       COLLAB_RPC_URL: "${COLLAB_RPC_URL:-}"
       RELEASES_DIR: "/releases"
       EXTENSIONS_DIR: "/extensions"
+      ACP_DIR: "/acp"
       # GitLab-backed sign-in. Leave CLIENT_ID/SECRET empty to keep the
       # password-less username form. GITLAB_URL may point at a self-hosted
       # instance. REDIRECT_URI must match the callback registered on the GitLab
@@ -74,6 +75,7 @@ services:
       # Local-mode fallback mounts (unused when S3 is configured above).
       - ./releases:/releases:ro
       - ./extensions:/extensions:ro
+      - ./acp:/acp:ro
     ports:
       - "8443:8443"   # client-facing HTTPS  (Zed's server_url)
       - "8080:8080"   # collab RPC websocket (served by the collab container)

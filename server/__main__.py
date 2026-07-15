@@ -10,8 +10,9 @@ Parses CLI flags / env, populates `config.config`, and runs the FastAPI app
 Identity is GitLab OAuth when GITLAB_CLIENT_ID/SECRET are set (any gitlab.com or
 self-hosted instance via GITLAB_URL), else a password-less username form. Users
 and tokens persist in Postgres when AUTH_DATABASE_URL is set (an `auth` schema),
-otherwise in data/state.json. Releases and extensions are stored in S3/MinIO
-when S3_ENDPOINT_URL/S3_BUCKET are set, otherwise in local dirs. This grants
+otherwise in data/state.json. Releases, extensions, and ACP registry agents are
+stored in S3/MinIO when S3_ENDPOINT_URL/S3_BUCKET are set, otherwise in local
+dirs. This grants
 every user a zed_free plan and admin — a self-hosted test backend, not a
 hardened one.
 
@@ -105,6 +106,11 @@ def parse_args() -> argparse.Namespace:
         help="Directory with scraped extension archives + index.json for /extensions",
     )
     parser.add_argument(
+        "--acp-dir",
+        default=os.environ.get("ACP_DIR", "acp"),
+        help="Directory with mirrored ACP agent archives + index.json for /registry",
+    )
+    parser.add_argument(
         "--gitlab-url",
         default=os.environ.get("GITLAB_URL", "https://gitlab.com"),
         help="GitLab instance base URL (gitlab.com or a self-hosted instance)",
@@ -147,9 +153,10 @@ def configure(args: argparse.Namespace) -> None:
     config.collab_database_url = args.collab_database_url
     config.releases_dir = Path(args.releases_dir)
     config.extensions_dir = Path(args.extensions_dir)
+    config.acp_dir = Path(args.acp_dir)
     config.blobs = BlobStore.from_env()
     if config.blobs is not None:
-        print(f"assets: S3 bucket '{config.blobs.bucket}' (releases + extensions)")
+        print(f"assets: S3 bucket '{config.blobs.bucket}' (releases + extensions + acp)")
     else:
         print("assets: local dirs (set S3_ENDPOINT_URL/S3_BUCKET for S3/MinIO)")
 
