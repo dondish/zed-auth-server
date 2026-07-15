@@ -1,0 +1,99 @@
+# MinIO: S3 store for release installers + extension/agent archives.
+# The cloud server streams objects back through its own HTTPS listener, so
+# MinIO stays internal (ClusterIP only, no Route). For a real cluster you can
+# drop this file and point S3_* at AWS S3 instead.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+  # storageClassName: <your-default-sc>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args: ["server", "/data", "--console-address", ":9001"]
+          envFrom:
+            - secretRef:
+                name: zed-secrets   # MINIO_ROOT_USER / MINIO_ROOT_PASSWORD
+          ports:
+            - containerPort: 9000
+            - containerPort: 9001
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { memory: "1Gi" }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data
+---
+# One-shot: create the bucket, then exit. Safe to re-run (mb --ignore-existing).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-createbucket
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - >
+              until mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; do
+                echo "waiting for minio..."; sleep 3;
+              done &&
+              mc mb --ignore-existing "local/$S3_BUCKET" &&
+              echo "bucket $S3_BUCKET ready"
+          envFrom:
+            - secretRef:
+                name: zed-secrets    # MINIO_ROOT_USER / MINIO_ROOT_PASSWORD
+            - configMapRef:
+                name: zed-config     # S3_BUCKET

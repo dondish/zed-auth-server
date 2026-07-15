@@ -2,6 +2,9 @@
 certs/
 data/
 .env
+# Filled-in Kubernetes/OpenShift secret manifests (templates end in .example.yaml)
+deploy/**/secrets.local.yaml
+deploy/**/*.local.yaml
 
 # Scraped release installers (large binaries; regenerate with scrape_releases.py)
 releases/

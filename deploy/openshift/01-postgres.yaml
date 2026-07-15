@@ -1,0 +1,75 @@
+# Postgres: collab's schema (public.*) + this server's `auth` schema.
+# Uses the stock postgres image so the collab dump (which does
+# `CREATE EXTENSION pg_trgm`, requiring superuser) loads via initdb.d exactly
+# like docker-compose. That image runs as its baked UID, so its ServiceAccount
+# needs the `anyuid` SCC — see deploy/openshift/README.md.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName: <your-default-sc>   # omit to use the cluster default
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          envFrom:
+            - secretRef:
+                name: zed-secrets   # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata
+            # Collab's schema dump. Runs once, on first init of the volume.
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { memory: "1Gi" }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+        - name: initdb
+          configMap:
+            name: collab-schema   # created from the repo — see README

@@ -1,0 +1,41 @@
+# External access.
+#
+# cloud (8443): passthrough — the app serves its own cert on 8443, so TLS goes
+# straight to the pod. The cert MUST be publicly trusted: the Zed cloud
+# websocket (/client/users/connect) validates against compiled-in Mozilla roots
+# (webpki-roots), not the OS store, so a self-signed cert is rejected there.
+# Use a real cert (Let's Encrypt / cert-manager) in the zed-tls secret.
+#
+# Zed's server_url then becomes https://zed.dondish.me (port 443, no :8443).
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: zed-cloud
+spec:
+  host: zed.dondish.me
+  to:
+    kind: Service
+    name: zed-cloud
+  port:
+    targetPort: 8443
+  tls:
+    termination: passthrough
+    insecureEdgeTerminationPolicy: Redirect
+---
+# collab (8080): collab speaks plain ws, so terminate TLS at the router (edge)
+# and forward plaintext to 8080. Clients reach it over wss://; this URL is what
+# COLLAB_RPC_URL in the ConfigMap points at.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: zed-collab
+spec:
+  host: collab.zed.dondish.me
+  to:
+    kind: Service
+    name: zed-cloud
+  port:
+    targetPort: 8080
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

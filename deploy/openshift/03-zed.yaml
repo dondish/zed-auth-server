@@ -1,0 +1,129 @@
+# The auth/cloud server and collab, together in ONE Pod.
+#
+# collab in ZED_ENVIRONMENT=development hardcodes its cloud URL to
+# http://localhost:8787 (crates/collab/src/lib.rs). Containers in a Pod share a
+# network namespace, so collab's localhost:8787 reaches the cloud sidecar —
+# this is the Kubernetes equivalent of docker-compose's
+# `network_mode: service:cloud`. Keep replicas at 1 (collab holds room state).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zed-config
+data:
+  # Non-secret env shared by the containers. Adjust hosts for your cluster.
+  S3_ENDPOINT_URL: "http://minio:9000"
+  S3_BUCKET: "zed-assets"
+  S3_REGION: "us-east-1"
+  GITLAB_URL: "https://gitlab.com"
+  GITLAB_REDIRECT_URI: "https://zed.dondish.me/auth/gitlab/callback"
+  # Where GET /rpc sends clients for the collab websocket (the collab Route).
+  COLLAB_RPC_URL: "https://collab.zed.dondish.me/rpc"
+  ZED_ENVIRONMENT: "development"
+  HTTP_PORT: "8080"
+  DATABASE_MAX_CONNECTIONS: "5"
+  RUST_LOG: "info"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zed-cloud
+spec:
+  selector:
+    app: zed-cloud
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+    - name: collab
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zed-cloud
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: zed-cloud
+  template:
+    metadata:
+      labels:
+        app: zed-cloud
+    spec:
+      # Wait for Postgres + MinIO so the cloud store doesn't crash-loop at boot.
+      initContainers:
+        - name: wait-for-deps
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - >
+              until nc -z postgres 5432; do echo "waiting for postgres"; sleep 2; done;
+              until nc -z minio 9000; do echo "waiting for minio"; sleep 2; done;
+              echo ready
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+      containers:
+        # --- the FastAPI auth + cloud API stand-in ---
+        - name: cloud
+          image: image-registry.openshift-image-registry.svc:5000/zed/zed-auth-server-cloud:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--host=0.0.0.0"
+            - "--port=8443"
+            - "--internal-port=8787"
+            - "--cert-dir=/certs"
+            - "--data-dir=/tmp"      # unused with Postgres; keep off any RO fs
+          envFrom:
+            - configMapRef: { name: zed-config }
+            - secretRef: { name: zed-secrets }   # AUTH_/COLLAB_DATABASE_URL, S3 keys, GitLab, internal key
+          ports:
+            - containerPort: 8443
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8443, scheme: HTTPS }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: certs
+              mountPath: /certs
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { memory: "512Mi" }
+        # --- Zed's collab server (shares this Pod's localhost with cloud) ---
+        - name: collab
+          image: image-registry.openshift-image-registry.svc:5000/zed/zed-auth-server-collab:latest
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "collab"]
+          envFrom:
+            - configMapRef: { name: zed-config }   # ZED_ENVIRONMENT, HTTP_PORT, DATABASE_MAX_CONNECTIONS, RUST_LOG
+            - secretRef: { name: zed-secrets }      # DATABASE_URL, ZED_CLOUD_INTERNAL_API_KEY
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits: { memory: "1Gi" }
+      volumes:
+        - name: certs
+          secret:
+            secretName: zed-tls    # keys MUST be named server.crt / server.key
